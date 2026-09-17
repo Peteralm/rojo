@@ -131,4 +131,62 @@ return function()
 
 		Settings:set("apiPermissions", priorPermissions)
 	end)
+
+	it("should ask the user when nobody may answer a sync confirmation", function()
+		local api = newApiAsSource("user_Companion.rbxmx")
+
+		expect(api:_requestSyncConfirmation({
+			projectName = "Test",
+			instanceCount = 1,
+			changeCount = 2,
+			changes = "- Delete instance Workspace.Part",
+		})).to.equal(nil)
+	end)
+
+	it("should let a granted caller answer a sync confirmation", function()
+		local priorPermissions = Settings:get("apiPermissions")
+		local api = newApiAsSource("user_Companion.rbxmx")
+		api:_setPermissions("user_Companion.rbxmx", "Companion", { "SyncConfirmationRequested" })
+
+		local request = nil
+		local connection = api.SyncConfirmationRequested:Connect(function(incoming)
+			request = incoming
+		end)
+
+		task.spawn(function()
+			-- The request is fired before this yields, so the responder sees it.
+			repeat
+				task.wait()
+			until request ~= nil
+			api:RespondToSyncConfirmation(request.Id, "Accept")
+		end)
+
+		local response = api:_requestSyncConfirmation({
+			projectName = "Test",
+			instanceCount = 1,
+			changeCount = 2,
+			changes = "- Delete instance Workspace.Part",
+		})
+
+		expect(response).to.equal("Accept")
+		expect(request.ProjectName).to.equal("Test")
+		expect(request.InstanceCount).to.equal(1)
+		expect(request.ChangeCount).to.equal(2)
+		expect(request.Changes).to.equal("- Delete instance Workspace.Part")
+
+		-- The same answer cannot be given twice, so a stale id is refused.
+		expect(api:RespondToSyncConfirmation(request.Id, "Accept")).to.equal(false)
+
+		connection:Disconnect()
+		api:_removePermissions("user_Companion.rbxmx", "Companion")
+		Settings:set("apiPermissions", priorPermissions)
+	end)
+
+	it("should refuse a response that is not a sync decision", function()
+		local api = newApiAsSource("user_Companion.rbxmx")
+
+		expect(function()
+			api:RespondToSyncConfirmation("1", "Maybe")
+		end).to.throw()
+	end)
 end

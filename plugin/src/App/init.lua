@@ -984,6 +984,19 @@ function App:startSession(host: string?, port: string?, onSettled: ((boolean, st
 			end
 		end
 
+		-- A plugin that was granted access can answer instead of the user, which
+		-- is what lets tooling sync while nobody is watching Studio.
+		local apiResponse = self.headlessAPI:_requestSyncConfirmation({
+			projectName = serverInfo.projectName,
+			instanceCount = PatchSet.countInstances(patch),
+			changeCount = PatchSet.countChanges(patch),
+			changes = PatchSet.humanSummary(instanceMap, patch),
+		})
+		if apiResponse ~= nil then
+			Log.trace("Answering patch confirmation with '{}' from the headless API", apiResponse)
+			return apiResponse
+		end
+
 		self:setState({
 			connectingText = "Computing diff view...",
 		})
