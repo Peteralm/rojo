@@ -1,3 +1,4 @@
+local HttpService = game:GetService("HttpService")
 local MarketplaceService = game:GetService("MarketplaceService")
 
 local Parent = script:FindFirstAncestor("Rojo")
@@ -15,11 +16,18 @@ local apiPermissionAllowlist = {
 	Version = true,
 	ProtocolVersion = true,
 	RequestAccess = true,
+	-- A confirmation is answered with an id that only a caller allowed to read
+	-- SyncConfirmationRequested ever sees, and an event handler runs on a thread
+	-- that no longer identifies that caller. The id is the permission here.
+	RespondToSyncConfirmation = true,
 }
 
 -- Callers with no plugin of their own in the traceback are attributed to this
 -- source: the command bar, and any chunk a plugin compiles at runtime.
 local COMMAND_BAR_SOURCE = "RobloxStudio_CommandBar"
+
+-- How long a sync confirmation waits for an answer before the user is asked.
+local SYNC_CONFIRMATION_TIMEOUT = 10
 
 export type CallerInfo = {
 	Source: string,
@@ -89,6 +97,7 @@ function API.new(app)
 	Rojo._permissions = loadPermissions()
 	Rojo._activePermissionRequests = {}
 	Rojo._changedEvent = Instance.new("BindableEvent")
+	Rojo._syncConfirmationEvent = Instance.new("BindableEvent")
 	Rojo._apiDescriptions = {}
 
 	Rojo._apiDescriptions.Changed = {
@@ -96,6 +105,12 @@ function API.new(app)
 		Description = "An event that fires when a Rojo API property changes",
 	}
 	Rojo.Changed = Rojo._changedEvent.Event
+
+	Rojo._apiDescriptions.SyncConfirmationRequested = {
+		Type = "Event",
+		Description = "An event that fires when a sync needs to be accepted or aborted",
+	}
+	Rojo.SyncConfirmationRequested = Rojo._syncConfirmationEvent.Event
 
 	Rojo._apiDescriptions.Connected = {
 		Type = "Property",
@@ -476,6 +491,95 @@ function API.new(app)
 		end
 
 		app:endSession()
+	end
+
+	Rojo._pendingSyncConfirmations = {}
+
+	function Rojo:_maySomeoneAnswerSyncConfirmations(): boolean
+		for _, apis in Rojo._permissions do
+			if apis.SyncConfirmationRequested then
+				return true
+			end
+		end
+
+		return false
+	end
+
+	-- Returns the response of whoever answers, or nil for the app to ask the user
+	-- instead: nobody may answer, or nobody did before the deadline.
+	function Rojo:_requestSyncConfirmation(summary: {
+		projectName: string,
+		instanceCount: number,
+		changeCount: number,
+		changes: string,
+	}): string?
+		if not Rojo:_maySomeoneAnswerSyncConfirmations() then
+			return nil
+		end
+
+		-- Unguessable, because holding the id is what allows answering.
+		local id = HttpService:GenerateGUID(false)
+
+		local thread = coroutine.running()
+		local answered, response = false, nil :: string?
+
+		Rojo._pendingSyncConfirmations[id] = function(answer: string?)
+			answered, response = true, answer
+
+			if coroutine.status(thread) == "suspended" then
+				task.spawn(thread)
+			end
+		end
+
+		task.delay(SYNC_CONFIRMATION_TIMEOUT, function()
+			local pending = Rojo._pendingSyncConfirmations[id]
+			if pending ~= nil then
+				Rojo._pendingSyncConfirmations[id] = nil
+				pending(nil)
+			end
+		end)
+
+		Rojo._syncConfirmationEvent:Fire(table.freeze({
+			Id = id,
+			ProjectName = summary.projectName,
+			InstanceCount = summary.instanceCount,
+			ChangeCount = summary.changeCount,
+			Changes = summary.changes,
+		}))
+
+		while not answered do
+			coroutine.yield()
+		end
+
+		Rojo._pendingSyncConfirmations[id] = nil
+
+		return response
+	end
+
+	Rojo._apiDescriptions.RespondToSyncConfirmation = {
+		Type = "Method",
+		Description = "Accepts or aborts a sync that Rojo would otherwise ask the user about",
+	}
+	function Rojo:RespondToSyncConfirmation(id: string, response: string): boolean
+		assert(type(id) == "string", "Id must be type `string`")
+		assert(
+			response == "Accept" or response == "Abort" or response == "Reject",
+			"Response must be 'Accept', 'Abort' or 'Reject'"
+		)
+
+		if Rojo:_checkRateLimit("RespondToSyncConfirmation") then
+			return false
+		end
+
+		local pending = Rojo._pendingSyncConfirmations[id]
+		if pending == nil then
+			return false
+		end
+
+		Rojo._pendingSyncConfirmations[id] = nil
+		pending(response)
+
+		return true
 	end
 
 	Rojo._apiDescriptions.GetSetting = {
