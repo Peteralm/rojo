@@ -1,22 +1,22 @@
 return function()
 	local HeadlessAPI = require(script.Parent.HeadlessAPI)
+	local ConnectionAttempt = require(script.Parent.ConnectionAttempt)
 	local Settings = require(script.Parent.Settings)
 
-	-- The API only starts and stops sessions, so a stub app is enough here.
-	-- onStartSession decides how the session this stub was asked for settles.
+	-- The API only starts and stops sessions, so a stub app is enough here. It
+	-- hands out the attempt it would have created, for the test to settle.
 	local function newStubApp()
-		local stub = { settleCount = 0 }
+		local stub = {}
 
-		function stub:startSession(host, port, onSettled)
+		function stub:startSession(host, port)
 			self.startedWith = { host = host, port = port }
-			self.settle = function(success, message)
-				self.settleCount += 1
-				onSettled(success, message)
-			end
+			self.attempt = ConnectionAttempt.new()
 
 			if self.onStartSession then
 				self.onStartSession()
 			end
+
+			return self.attempt
 		end
 
 		function stub:endSession() end
@@ -36,70 +36,91 @@ return function()
 		return api, readOnlyApi
 	end
 
-	it("should tell the caller when a session connects", function()
+	it("should hand the caller an attempt that reports a connected session", function()
 		local app = newStubApp()
 		local api = HeadlessAPI.new(app)
 
 		app.onStartSession = function()
-			app.settle(true)
+			app.attempt:_setSession("localhost:34872", "Test")
+			app.attempt:_settle(ConnectionAttempt.Status.Connected)
 		end
 
-		local success, message = api:ConnectAsync("localhost", "34872")
+		local attempt = api:ConnectAsync("localhost", "34872")
+		local connected, message = attempt:await()
 
-		expect(success).to.equal(true)
+		expect(connected).to.equal(true)
 		expect(message).to.equal(nil)
+		expect(attempt:getStatus()).to.equal(ConnectionAttempt.Status.Connected)
+		expect(select(1, attempt:getSession())).to.equal("localhost:34872")
+		expect(select(2, attempt:getSession())).to.equal("Test")
 		expect(app.startedWith.host).to.equal("localhost")
 		expect(app.startedWith.port).to.equal("34872")
 	end)
 
-	it("should tell the caller when a session fails before it starts", function()
+	it("should report why an attempt that was refused did not connect", function()
 		local app = newStubApp()
 		local api = HeadlessAPI.new(app)
 
-		-- A held sync lock settles inside startSession, before the caller yields.
+		-- A held sync lock settles inside startSession, before anyone can wait.
 		app.onStartSession = function()
-			app.settle(false, "Could not sync because user 'someone' is already syncing")
+			app.attempt:_settle(
+				ConnectionAttempt.Status.Refused,
+				ConnectionAttempt.Reason.SyncLockHeld,
+				"Could not sync because user 'someone' is already syncing"
+			)
 		end
 
-		local success, message = api:ConnectAsync()
+		local attempt = api:ConnectAsync()
+		local connected, message = attempt:await()
+		local reason = attempt:getReason()
 
-		expect(success).to.equal(false)
+		expect(connected).to.equal(false)
 		expect(message).to.equal("Could not sync because user 'someone' is already syncing")
+		expect(reason).to.equal(ConnectionAttempt.Reason.SyncLockHeld)
+		expect(attempt:getStatus()).to.equal(ConnectionAttempt.Status.Refused)
 	end)
 
-	it("should wait for a session that settles later", function()
+	it("should wait for an attempt that settles later", function()
 		local app = newStubApp()
 		local api = HeadlessAPI.new(app)
 
 		app.onStartSession = function()
 			task.delay(0.05, function()
-				app.settle(false, "Connection refused")
+				app.attempt:_settle(
+					ConnectionAttempt.Status.Failed,
+					ConnectionAttempt.Reason.ServerError,
+					"Connection refused"
+				)
 			end)
 		end
 
-		local success, message = api:ConnectAsync()
+		local attempt = api:ConnectAsync()
 
-		expect(success).to.equal(false)
+		expect(attempt:getStatus()).to.equal(ConnectionAttempt.Status.Connecting)
+
+		local connected, message = attempt:await()
+
+		expect(connected).to.equal(false)
 		expect(message).to.equal("Connection refused")
+		expect(attempt:getReason()).to.equal(ConnectionAttempt.Reason.ServerError)
 	end)
 
-	it("should answer a caller once, even if its session settles again", function()
+	it("should keep the first outcome of an attempt that settles again", function()
 		local app = newStubApp()
 		local api = HeadlessAPI.new(app)
 
 		app.onStartSession = function()
-			app.settle(true)
+			app.attempt:_settle(ConnectionAttempt.Status.Connected)
 		end
 
-		expect(api:ConnectAsync()).to.equal(true)
-		expect(app.settleCount).to.equal(1)
+		local attempt = api:ConnectAsync()
+		expect(attempt:await()).to.equal(true)
 
-		-- The session reporting again, as it does when it later disconnects, must
-		-- not reach a caller that already has its answer.
-		app.settle(false, "Disconnected from session")
+		-- The session disconnecting later must not rewrite an answered attempt.
+		attempt:_settle(ConnectionAttempt.Status.Failed, ConnectionAttempt.Reason.SessionEnded, "Disconnected")
 
-		expect(app.settleCount).to.equal(2)
-		expect(api:ConnectAsync()).to.equal(true)
+		expect(attempt:await()).to.equal(true)
+		expect(attempt:getStatus()).to.equal(ConnectionAttempt.Status.Connected)
 	end)
 
 	it("should refuse callers that have not been granted access", function()
