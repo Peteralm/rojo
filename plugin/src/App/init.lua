@@ -18,6 +18,7 @@ local Settings = require(Plugin.Settings)
 local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
+local ConnectionAttempt = require(Plugin.ConnectionAttempt)
 local ApiContext = require(Plugin.ApiContext)
 local HeadlessAPI = require(Plugin.HeadlessAPI)
 local PatchSet = require(Plugin.PatchSet)
@@ -743,23 +744,17 @@ function App:useRunningConnectionInfo()
 	self.setPort(port)
 end
 
-function App:startSession(host: string?, port: string?, onSettled: ((boolean, string?) -> ())?)
-	-- A caller that waits on this session is answered exactly once, and only
-	-- about the session it started.
-	local report = onSettled
-	local function settle(success: boolean, message: string?)
-		if report == nil then
-			return
-		end
-
-		local reportSettled = report
-		report = nil
-		reportSettled(success, message)
-	end
+function App:startSession(host: string?, port: string?): ConnectionAttempt.ConnectionAttempt
+	local attempt = ConnectionAttempt.new()
 
 	if self.serveSession ~= nil then
-		settle(false, "A sync session is already running")
-		return
+		attempt:_settle(
+			ConnectionAttempt.Status.Refused,
+			ConnectionAttempt.Reason.SessionAlreadyRunning,
+			"A sync session is already running"
+		)
+
+		return attempt
 	end
 
 	local claimedLock, priorOwner = self:claimSyncLock()
@@ -777,9 +772,9 @@ function App:startSession(host: string?, port: string?, onSettled: ((boolean, st
 			toolbarIcon = Assets.Images.PluginButtonWarning,
 		})
 
-		settle(false, msg)
+		attempt:_settle(ConnectionAttempt.Status.Refused, ConnectionAttempt.Reason.SyncLockHeld, msg)
 
-		return
+		return attempt
 	end
 
 	if host == nil or port == nil then
@@ -915,9 +910,22 @@ function App:startSession(host: string?, port: string?, onSettled: ((boolean, st
 		-- Settled last so that a caller waiting on this session sees the API
 		-- properties already describing it.
 		if status == ServeSession.Status.Connected then
-			settle(true)
+			attempt:_setSession(string.format("%s:%s", host :: string, port :: string), tostring(details))
+			attempt:_settle(ConnectionAttempt.Status.Connected)
 		elseif status == ServeSession.Status.Disconnected then
-			settle(false, if details ~= nil then tostring(details) else "Disconnected from session")
+			if details ~= nil then
+				attempt:_settle(
+					ConnectionAttempt.Status.Failed,
+					ConnectionAttempt.Reason.ServerError,
+					tostring(details)
+				)
+			else
+				attempt:_settle(
+					ConnectionAttempt.Status.Failed,
+					ConnectionAttempt.Reason.SessionEnded,
+					"Disconnected from session"
+				)
+			end
 		end
 	end)
 
@@ -1023,6 +1031,8 @@ function App:startSession(host: string?, port: string?, onSettled: ((boolean, st
 	serveSession:start()
 
 	self.serveSession = serveSession
+
+	return attempt
 end
 
 function App:endSession()

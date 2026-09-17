@@ -10,6 +10,7 @@ local Log = require(Packages.Log)
 local Config = require(Plugin.Config)
 local Settings = require(Plugin.Settings)
 local ApiContext = require(Plugin.ApiContext)
+local ConnectionAttempt = require(Plugin.ConnectionAttempt)
 
 local cloudIdProductInfoCache = {}
 local apiPermissionAllowlist = {
@@ -451,34 +452,24 @@ function API.new(app)
 
 	Rojo._apiDescriptions.ConnectAsync = {
 		Type = "Method",
-		Description = "Connects to a Rojo server and returns whether the session was established",
+		Description = "Connects to a Rojo server and returns the attempt to wait on",
 	}
-	function Rojo:ConnectAsync(host: string?, port: string?): (boolean, string?)
+	function Rojo:ConnectAsync(host: string?, port: string?): ConnectionAttempt.ConnectionAttempt
 		assert(type(host) == "string" or host == nil, "Host must be type `string?`")
 		assert(type(port) == "string" or port == nil, "Port must be type `string?`")
 
+		local attempt = ConnectionAttempt.new()
 		if Rojo:_checkRateLimit("ConnectAsync") then
-			return false, "Rojo:ConnectAsync is being rate limited"
+			attempt:_settle(
+				ConnectionAttempt.Status.Refused,
+				ConnectionAttempt.Reason.RateLimited,
+				"Rojo:ConnectAsync is being rate limited"
+			)
+
+			return attempt
 		end
 
-		-- The session can settle before startSession returns, as it does when one
-		-- is already running, so the thread yields only while still waiting.
-		local thread = coroutine.running()
-		local settled, success, message = false, false, nil :: string?
-
-		app:startSession(host, port, function(attemptSuccess: boolean, attemptMessage: string?)
-			settled, success, message = true, attemptSuccess, attemptMessage
-
-			if coroutine.status(thread) == "suspended" then
-				task.spawn(thread)
-			end
-		end)
-
-		while not settled do
-			coroutine.yield()
-		end
-
-		return success, message
+		return app:startSession(host, port)
 	end
 
 	Rojo._apiDescriptions.DisconnectAsync = {
